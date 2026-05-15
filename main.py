@@ -1,24 +1,22 @@
 """
 Агрегатор цен на запчасти Ponsse с 3 сайтов.
-Эндпоинт GET /api/search?article=XXX возвращает результаты по всем источникам.
 """
 
 import asyncio
+import os
 import re
 import time
 from typing import Optional
 from urllib.parse import quote_plus
 
-import os
 import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 
 app = FastAPI(title="Ponsse Parts Price Aggregator")
 
-# Отдаём index.html на корневом URL
 @app.get("/")
 async def root():
     return FileResponse(os.path.join(os.path.dirname(__file__), "index.html"))
@@ -30,9 +28,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----- ПРОСТОЙ КЭШ В ПАМЯТИ (TTL 24 часа) -----
 CACHE: dict[str, tuple[float, list]] = {}
-CACHE_TTL_SECONDS = 24 * 60 * 60  # 24 часа
+CACHE_TTL_SECONDS = 24 * 60 * 60
 
 HEADERS = {
     "User-Agent": (
@@ -40,10 +37,7 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,*/*;q=0.8"
-    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
@@ -57,29 +51,52 @@ HEADERS = {
 REQUEST_TIMEOUT = 15.0
 
 
+def normalize_article(s: str) -> str:
+    """Убирает пробелы, верхний регистр, кириллическая Р -> латинская P."""
+    return re.sub(r"\s+", "", s).upper().replace("Р", "P")
+
+
+def article_matches(article_query: str, title: str) -> bool:
+    """
+    P60055 найдёт: P60055, P60055CH, P60055ЛПС
+    НЕ найдёт: P31635, P600551 (другой артикул)
+    """
+    q = normalize_article(article_query)
+    t = normalize_article(title)
+    idx = t.find(q)
+    if idx == -1:
+        return False
+    # Символ ПЕРЕД вхождением не должен быть буквой/цифрой
+    if idx > 0 and t[idx - 1].isalnum():
+        return False
+    return True
+
+
 def parse_price(text: str) -> Optional[float]:
-    """Извлекает первое число (цена) из строки. Поддерживает формат '586.728,00 руб.'"""
+    """
+    Извлекает первую цену из строки. Формат: '48 607,00 руб.' или '48607 руб.'
+    Игнорирует числа > 50 000 000 (артефакты парсинга).
+    """
     if not text:
         return None
     cleaned = text.replace("\xa0", " ").strip()
-    # ищем последовательность цифр с разделителями
-    match = re.search(r"[\d][\d\s\.\u00a0]*(?:,\d{1,2})?", cleaned)
-    if not match:
+    m = re.search(r"([\d][\d\s\.]*(?:,\d{1,2})?)\s*руб", cleaned)
+    if not m:
         return None
-    raw = match.group(0).replace(" ", "").replace("\xa0", "")
-    # российский формат: точки = тысячи, запятая = десятичные
+    raw = m.group(1).replace(" ", "").replace("\xa0", "")
     if "," in raw:
         raw = raw.replace(".", "").replace(",", ".")
     else:
         raw = raw.replace(".", "")
     try:
-        return float(raw)
+        val = float(raw)
+        return val if val <= 50_000_000 else None
     except ValueError:
         return None
 
 
 # ============================================================
-# СКРАПЕР 1: saleponsse.ru (движок ShopOS)
+# СКРАПЕР 1: saleponsse.ru
 # ============================================================
 async def scrape_saleponsse(client: httpx.AsyncClient, article: str) -> list[dict]:
     url = f"http://saleponsse.ru/advanced_search_result.php?keywords={quote_plus(article)}"
@@ -91,21 +108,20 @@ async def scrape_saleponsse(client: httpx.AsyncClient, article: str) -> list[dic
 
     soup = BeautifulSoup(resp.text, "lxml")
     results = []
-
-    # На ShopOS товары обычно лежат в таблицах со ссылками product_info.php
-    product_links = soup.select('a[href*="product_info.php"]')
     seen = set()
-    for a in product_links:
+
+    for a in soup.select('a[href*="product_info.php"]'):
         href = a.get("href", "")
         if href in seen:
             continue
-        # пропускаем картинки/превью без названия
         title = a.get_text(strip=True)
         if not title or len(title) < 3:
             continue
+        # Только те товары, где искомый артикул реально есть в названии
+        if not article_matches(article, title):
+            continue
         seen.add(href)
 
-        # ищем цену рядом с этой ссылкой — поднимаемся к ближайшему родителю-блоку
         parent = a
         price = None
         for _ in range(6):
@@ -114,31 +130,23 @@ async def scrape_saleponsse(client: httpx.AsyncClient, article: str) -> list[dic
                 break
             txt = parent.get_text(" ", strip=True)
             if "руб" in txt.lower():
-                # выделяем фрагмент с ценой
-                m = re.search(r"([\d][\d\s\.\u00a0]*(?:,\d{1,2})?)\s*руб", txt)
-                if m:
-                    price = parse_price(m.group(1))
+                price = parse_price(txt)
+                if price:
                     break
 
         full_url = href if href.startswith("http") else f"http://saleponsse.ru/{href.lstrip('/')}"
-        results.append({
-            "source": "saleponsse.ru",
-            "title": title,
-            "price": price,
-            "currency": "RUB",
-            "url": full_url,
-        })
+        results.append({"source": "saleponsse.ru", "title": title, "price": price, "currency": "RUB", "url": full_url})
 
-    if not results:
-        return [{"source": "saleponsse.ru", "error": "Ничего не найдено"}]
-    return results[:10]
+    return results[:10] if results else [{"source": "saleponsse.ru", "error": "Ничего не найдено"}]
 
 
 # ============================================================
-# СКРАПЕР 2: store.lpskomi.ru (1С-Битрикс)
+# СКРАПЕР 2: store.lpskomi.ru
+# Проблема с ценой: парсер захватывал много текста и склеивал числа.
+# Решение: ищем самый маленький блок с "руб" (не длиннее 40 символов).
 # ============================================================
 async def scrape_lpskomi(client: httpx.AsyncClient, article: str) -> list[dict]:
-    url = f"https://store.lpskomi.ru/search/?q={quote_plus(article)}&s=Найти"
+    url = f"https://store.lpskomi.ru/search/?q={quote_plus(article)}&s=%D0%9D%D0%B0%D0%B9%D1%82%D0%B8"
     try:
         resp = await client.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, follow_redirects=True)
         resp.raise_for_status()
@@ -147,123 +155,129 @@ async def scrape_lpskomi(client: httpx.AsyncClient, article: str) -> list[dict]:
 
     soup = BeautifulSoup(resp.text, "lxml")
     results = []
-
-    # Битриксовый поиск выдаёт ссылки на /catalog/<ID>/
-    catalog_links = soup.select('a[href*="/catalog/"]')
     seen = set()
-    for a in catalog_links:
+
+    for a in soup.select('a[href*="/catalog/"]'):
         href = a.get("href", "")
-        # отсеиваем категории — у товаров путь /catalog/<число>/
         if not re.search(r"/catalog/\d+/?$", href):
             continue
         title = a.get_text(strip=True)
         if not title or len(title) < 3 or title in seen:
             continue
+        if not article_matches(article, title):
+            continue
         seen.add(title)
 
-        # ищем цену в окрестности
-        parent = a
+        # Ищем цену: берём ближайший маленький блок с "руб"
         price = None
-        for _ in range(8):
+        parent = a
+        for _ in range(5):
             parent = parent.parent
             if parent is None:
                 break
-            txt = parent.get_text(" ", strip=True)
-            if "руб" in txt.lower():
-                m = re.search(r"([\d][\d\s\.\u00a0]*(?:,\d{1,2})?)\s*руб", txt)
-                if m:
-                    price = parse_price(m.group(1))
-                    break
+            # Перебираем все теги внутри родителя — берём самый компактный с ценой
+            for tag in parent.find_all(True):
+                tag_txt = tag.get_text(" ", strip=True)
+                if "руб" in tag_txt.lower() and 2 < len(tag_txt) < 40:
+                    p = parse_price(tag_txt)
+                    if p:
+                        price = p
+                        break
+            if price:
+                break
 
         full_url = href if href.startswith("http") else f"https://store.lpskomi.ru{href}"
-        results.append({
-            "source": "store.lpskomi.ru",
-            "title": title,
-            "price": price,
-            "currency": "RUB",
-            "url": full_url,
-        })
+        results.append({"source": "store.lpskomi.ru", "title": title, "price": price, "currency": "RUB", "url": full_url})
 
-    if not results:
-        return [{"source": "store.lpskomi.ru", "error": "Ничего не найдено"}]
-    return results[:10]
+    return results[:10] if results else [{"source": "store.lpskomi.ru", "error": "Ничего не найдено"}]
 
 
 # ============================================================
-# СКРАПЕР 3: shop.gsperm.pro (AdVantShop.NET)
+# СКРАПЕР 3: shop.gsperm.pro
+# Их поиск рендерится через JS — прямой GET пустой.
+# Решение: ищем товары через Яндекс (site:shop.gsperm.pro АРТИКУЛ),
+# затем заходим на каждую страницу товара напрямую.
 # ============================================================
 async def scrape_gsperm(client: httpx.AsyncClient, article: str) -> list[dict]:
-    url = f"https://shop.gsperm.pro/search?searchText={quote_plus(article)}"
+    yandex_url = f"https://yandex.ru/search/?text=site%3Ashop.gsperm.pro+{quote_plus(article)}&lr=2"
+    try:
+        resp = await client.get(yandex_url, headers=HEADERS, timeout=REQUEST_TIMEOUT, follow_redirects=True)
+        resp.raise_for_status()
+    except Exception as e:
+        return [{"source": "shop.gsperm.pro", "error": f"Ошибка поиска: {e}"}]
+
+    soup = BeautifulSoup(resp.text, "lxml")
+
+    product_urls = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        clean = re.search(r"(https?://shop\.gsperm\.pro/products/[^\s\"&?]+)", href)
+        if clean:
+            u = clean.group(1)
+            if u not in product_urls:
+                product_urls.append(u)
+
+    if not product_urls:
+        return [{"source": "shop.gsperm.pro", "error": "Ничего не найдено"}]
+
+    tasks = [_fetch_gsperm_product(client, url, article) for url in product_urls[:5]]
+    items = await asyncio.gather(*tasks, return_exceptions=True)
+    results = [i for i in items if isinstance(i, dict) and i]
+
+    return results if results else [{"source": "shop.gsperm.pro", "error": "Ничего не найдено"}]
+
+
+async def _fetch_gsperm_product(client: httpx.AsyncClient, url: str, article: str) -> dict:
     try:
         resp = await client.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, follow_redirects=True)
         resp.raise_for_status()
-    except Exception as e:
-        return [{"source": "shop.gsperm.pro", "error": f"Ошибка запроса: {e}"}]
+    except Exception:
+        return {}
 
     soup = BeautifulSoup(resp.text, "lxml")
-    results = []
+    h1 = soup.find("h1")
+    title = h1.get_text(strip=True) if h1 else url.split("/")[-1]
 
-    # AdVantShop: ссылки на товары вида /products/<slug>
-    product_links = soup.select('a[href*="/products/"]')
-    seen = set()
-    for a in product_links:
-        href = a.get("href", "")
-        title = a.get_text(strip=True)
-        if not title or len(title) < 3:
-            continue
-        if title in seen:
-            continue
-        seen.add(title)
+    if not article_matches(article, title):
+        return {}
 
-        parent = a
-        price = None
-        for _ in range(8):
-            parent = parent.parent
-            if parent is None:
+    price = None
+    # Ищем по классам price/cost
+    for selector in ["[class*='price']", "[class*='cost']", "[class*='Price']"]:
+        el = soup.select_one(selector)
+        if el:
+            p = parse_price(el.get_text(" ", strip=True))
+            if p:
+                price = p
                 break
-            txt = parent.get_text(" ", strip=True)
-            if "руб" in txt.lower():
-                m = re.search(r"([\d][\d\s\.\u00a0]*(?:,\d{1,2})?)\s*руб", txt)
-                if m:
-                    price = parse_price(m.group(1))
-                    break
+    # Если не нашли — берём первое число с "руб" на странице
+    if not price:
+        page_text = soup.get_text(" ")
+        price = parse_price(page_text)
 
-        full_url = href if href.startswith("http") else f"https://shop.gsperm.pro{href}"
-        results.append({
-            "source": "shop.gsperm.pro",
-            "title": title,
-            "price": price,
-            "currency": "RUB",
-            "url": full_url,
-        })
-
-    if not results:
-        return [{"source": "shop.gsperm.pro", "error": "Ничего не найдено"}]
-    return results[:10]
+    return {"source": "shop.gsperm.pro", "title": title, "price": price, "currency": "RUB", "url": url}
 
 
 # ============================================================
-# ОСНОВНОЙ ЭНДПОИНТ
+# ЭНДПОИНТЫ
 # ============================================================
 @app.get("/api/search")
-async def search(article: str = Query(..., min_length=2, description="Артикул запчасти")):
+async def search(article: str = Query(..., min_length=2)):
     article_clean = article.strip()
     cache_key = article_clean.lower()
 
-    # проверка кэша
     if cache_key in CACHE:
         ts, data = CACHE[cache_key]
         if time.time() - ts < CACHE_TTL_SECONDS:
             return {"article": article_clean, "cached": True, "results": data}
 
-    # параллельные запросы ко всем трём сайтам
     async with httpx.AsyncClient() as client:
-        tasks = [
+        results_lists = await asyncio.gather(
             scrape_saleponsse(client, article_clean),
             scrape_lpskomi(client, article_clean),
             scrape_gsperm(client, article_clean),
-        ]
-        results_lists = await asyncio.gather(*tasks, return_exceptions=True)
+            return_exceptions=True,
+        )
 
     all_results = []
     for r in results_lists:
@@ -272,9 +286,7 @@ async def search(article: str = Query(..., min_length=2, description="Артик
         else:
             all_results.extend(r)
 
-    # пишем в кэш
     CACHE[cache_key] = (time.time(), all_results)
-
     return {"article": article_clean, "cached": False, "results": all_results}
 
 
