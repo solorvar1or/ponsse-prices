@@ -1,8 +1,13 @@
 """
 Агрегатор цен на запчасти Ponsse с 3 сайтов.
+- saleponsse.ru   — парсинг HTML страницы поиска
+- store.lpskomi.ru — парсинг публичного CSV прайса (надёжнее HTML)
+- shop.gsperm.pro  — поиск через Google site: + парсинг страниц товаров
 """
 
 import asyncio
+import csv
+import io
 import os
 import re
 import time
@@ -14,12 +19,62 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from contextlib import asynccontextmanager
 
-app = FastAPI(title="Ponsse Parts Price Aggregator")
+# ============================================================
+# CSV-прайс lpskomi: загружаем при старте, обновляем раз в 24 ч
+# ============================================================
+LPS_CSV_URL = "https://www1.lpskomi.ru/marketplase.csv"
+LPS_STORE_BASE = "https://store.lpskomi.ru"
+
+lps_cache: dict = {"rows": [], "loaded_at": 0.0}
+LPS_TTL = 24 * 60 * 60
+
+
+async def load_lps_csv(client: httpx.AsyncClient):
+    """Скачивает CSV прайс lpskomi и кладёт в память."""
+    try:
+        resp = await client.get(LPS_CSV_URL, headers=HEADERS, timeout=20.0)
+        resp.raise_for_status()
+        # CSV в windows-1251 или utf-8-sig
+        try:
+            text = resp.content.decode("utf-8-sig")
+        except Exception:
+            text = resp.content.decode("cp1251", errors="replace")
+        reader = csv.reader(io.StringIO(text), delimiter=";")
+        rows = []
+        for i, row in enumerate(reader):
+            if i == 0:
+                continue  # заголовок
+            if len(row) < 5:
+                continue
+            # row: УИД; Наименование; Артикул; Артикул поставщика; Оптовая цена; ...
+            rows.append({
+                "title": row[1].strip(),
+                "article": row[2].strip(),
+                "price_str": row[4].strip(),
+            })
+        lps_cache["rows"] = rows
+        lps_cache["loaded_at"] = time.time()
+        print(f"[lpskomi CSV] загружено {len(rows)} позиций")
+    except Exception as e:
+        print(f"[lpskomi CSV] ошибка загрузки: {e}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with httpx.AsyncClient() as client:
+        await load_lps_csv(client)
+    yield
+
+
+app = FastAPI(title="Ponsse Parts Price Aggregator", lifespan=lifespan)
+
 
 @app.get("/")
 async def root():
     return FileResponse(os.path.join(os.path.dirname(__file__), "index.html"))
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,53 +92,53 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
 }
 
 REQUEST_TIMEOUT = 15.0
 
 
-def normalize_article(s: str) -> str:
+def normalize(s: str) -> str:
     """Убирает пробелы, верхний регистр, кириллическая Р -> латинская P."""
     return re.sub(r"\s+", "", s).upper().replace("Р", "P")
 
 
-def article_matches(article_query: str, title: str) -> bool:
+def article_matches(query: str, title: str) -> bool:
     """
-    P60055 найдёт: P60055, P60055CH, P60055ЛПС
-    НЕ найдёт: P31635, P600551 (другой артикул)
+    Артикул query должен присутствовать в title как отдельная часть.
+    P60055 найдёт P60055, P60055CH, P60055ЛПС — но не P31635.
     """
-    q = normalize_article(article_query)
-    t = normalize_article(title)
+    q = normalize(query)
+    t = normalize(title)
     idx = t.find(q)
     if idx == -1:
         return False
-    # Символ ПЕРЕД вхождением не должен быть буквой/цифрой
+    # символ ДО вхождения не должен быть буквой/цифрой
     if idx > 0 and t[idx - 1].isalnum():
         return False
     return True
 
 
 def parse_price(text: str) -> Optional[float]:
-    """
-    Извлекает первую цену из строки. Формат: '48 607,00 руб.' или '48607 руб.'
-    Игнорирует числа > 50 000 000 (артефакты парсинга).
-    """
+    """Извлекает первую цену из строки (российский формат)."""
     if not text:
         return None
     cleaned = text.replace("\xa0", " ").strip()
     m = re.search(r"([\d][\d\s\.]*(?:,\d{1,2})?)\s*руб", cleaned)
     if not m:
+        # Для CSV — просто число
+        m2 = re.match(r"^([\d]+(?:\.\d{1,2})?)$", cleaned.replace(",", "."))
+        if m2:
+            try:
+                return float(m2.group(1))
+            except ValueError:
+                return None
         return None
-    raw = m.group(1).replace(" ", "").replace("\xa0", "")
+    raw = m.group(1).replace(" ", "")
     if "," in raw:
         raw = raw.replace(".", "").replace(",", ".")
     else:
@@ -117,7 +172,6 @@ async def scrape_saleponsse(client: httpx.AsyncClient, article: str) -> list[dic
         title = a.get_text(strip=True)
         if not title or len(title) < 3:
             continue
-        # Только те товары, где искомый артикул реально есть в названии
         if not article_matches(article, title):
             continue
         seen.add(href)
@@ -135,73 +189,64 @@ async def scrape_saleponsse(client: httpx.AsyncClient, article: str) -> list[dic
                     break
 
         full_url = href if href.startswith("http") else f"http://saleponsse.ru/{href.lstrip('/')}"
-        results.append({"source": "saleponsse.ru", "title": title, "price": price, "currency": "RUB", "url": full_url})
+        results.append({"source": "saleponsse.ru", "title": title,
+                        "price": price, "currency": "RUB", "url": full_url})
 
     return results[:10] if results else [{"source": "saleponsse.ru", "error": "Ничего не найдено"}]
 
 
 # ============================================================
-# СКРАПЕР 2: store.lpskomi.ru
-# Проблема с ценой: парсер захватывал много текста и склеивал числа.
-# Решение: ищем самый маленький блок с "руб" (не длиннее 40 символов).
+# СКРАПЕР 2: store.lpskomi.ru — поиск по CSV прайсу
 # ============================================================
 async def scrape_lpskomi(client: httpx.AsyncClient, article: str) -> list[dict]:
-    url = f"https://store.lpskomi.ru/search/?q={quote_plus(article)}&s=%D0%9D%D0%B0%D0%B9%D1%82%D0%B8"
-    try:
-        resp = await client.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, follow_redirects=True)
-        resp.raise_for_status()
-    except Exception as e:
-        return [{"source": "store.lpskomi.ru", "error": f"Ошибка запроса: {e}"}]
+    # Обновляем CSV если устарел
+    if time.time() - lps_cache["loaded_at"] > LPS_TTL or not lps_cache["rows"]:
+        await load_lps_csv(client)
 
-    soup = BeautifulSoup(resp.text, "lxml")
+    rows = lps_cache["rows"]
+    if not rows:
+        return [{"source": "store.lpskomi.ru", "error": "Прайс не загружен"}]
+
     results = []
-    seen = set()
+    for row in rows:
+        title_full = f"{row['title']} {row['article']}"
+        if not article_matches(article, title_full):
+            continue
 
-    for a in soup.select('a[href*="/catalog/"]'):
-        href = a.get("href", "")
-        if not re.search(r"/catalog/\d+/?$", href):
-            continue
-        title = a.get_text(strip=True)
-        if not title or len(title) < 3 or title in seen:
-            continue
-        if not article_matches(article, title):
-            continue
-        seen.add(title)
-
-        # Ищем цену: берём ближайший маленький блок с "руб"
         price = None
-        parent = a
-        for _ in range(5):
-            parent = parent.parent
-            if parent is None:
-                break
-            # Перебираем все теги внутри родителя — берём самый компактный с ценой
-            for tag in parent.find_all(True):
-                tag_txt = tag.get_text(" ", strip=True)
-                if "руб" in tag_txt.lower() and 2 < len(tag_txt) < 40:
-                    p = parse_price(tag_txt)
-                    if p:
-                        price = p
-                        break
-            if price:
-                break
+        ps = row["price_str"].replace(",", ".")
+        try:
+            v = float(ps)
+            price = v if 0 < v <= 50_000_000 else None
+        except ValueError:
+            pass
 
-        full_url = href if href.startswith("http") else f"https://store.lpskomi.ru{href}"
-        results.append({"source": "store.lpskomi.ru", "title": title, "price": price, "currency": "RUB", "url": full_url})
+        # Ссылка на поиск — точного URL товара в CSV нет
+        search_url = f"{LPS_STORE_BASE}/search/?q={quote_plus(row['article'])}"
+        results.append({
+            "source": "store.lpskomi.ru",
+            "title": row["title"],
+            "price": price,
+            "currency": "RUB",
+            "url": search_url,
+        })
 
     return results[:10] if results else [{"source": "store.lpskomi.ru", "error": "Ничего не найдено"}]
 
 
 # ============================================================
-# СКРАПЕР 3: shop.gsperm.pro
-# Их поиск рендерится через JS — прямой GET пустой.
-# Решение: ищем товары через Яндекс (site:shop.gsperm.pro АРТИКУЛ),
-# затем заходим на каждую страницу товара напрямую.
+# СКРАПЕР 3: shop.gsperm.pro — поиск через Google
 # ============================================================
 async def scrape_gsperm(client: httpx.AsyncClient, article: str) -> list[dict]:
-    yandex_url = f"https://yandex.ru/search/?text=site%3Ashop.gsperm.pro+{quote_plus(article)}&lr=2"
+    # Ищем через Google: site:shop.gsperm.pro АРТИКУЛ
+    google_url = (
+        f"https://www.google.com/search?q=site%3Ashop.gsperm.pro+{quote_plus(article)}"
+        f"&hl=ru&num=10"
+    )
+    google_headers = {**HEADERS, "Accept-Language": "ru-RU,ru;q=0.9"}
     try:
-        resp = await client.get(yandex_url, headers=HEADERS, timeout=REQUEST_TIMEOUT, follow_redirects=True)
+        resp = await client.get(google_url, headers=google_headers,
+                                timeout=REQUEST_TIMEOUT, follow_redirects=True)
         resp.raise_for_status()
     except Exception as e:
         return [{"source": "shop.gsperm.pro", "error": f"Ошибка поиска: {e}"}]
@@ -211,9 +256,10 @@ async def scrape_gsperm(client: httpx.AsyncClient, article: str) -> list[dict]:
     product_urls = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
+        # Google оборачивает ссылки в /url?q=...
         clean = re.search(r"(https?://shop\.gsperm\.pro/products/[^\s\"&?]+)", href)
         if clean:
-            u = clean.group(1)
+            u = clean.group(1).rstrip("/")
             if u not in product_urls:
                 product_urls.append(u)
 
@@ -242,7 +288,6 @@ async def _fetch_gsperm_product(client: httpx.AsyncClient, url: str, article: st
         return {}
 
     price = None
-    # Ищем по классам price/cost
     for selector in ["[class*='price']", "[class*='cost']", "[class*='Price']"]:
         el = soup.select_one(selector)
         if el:
@@ -250,12 +295,11 @@ async def _fetch_gsperm_product(client: httpx.AsyncClient, url: str, article: st
             if p:
                 price = p
                 break
-    # Если не нашли — берём первое число с "руб" на странице
     if not price:
-        page_text = soup.get_text(" ")
-        price = parse_price(page_text)
+        price = parse_price(soup.get_text(" "))
 
-    return {"source": "shop.gsperm.pro", "title": title, "price": price, "currency": "RUB", "url": url}
+    return {"source": "shop.gsperm.pro", "title": title,
+            "price": price, "currency": "RUB", "url": url}
 
 
 # ============================================================
@@ -298,4 +342,4 @@ async def clear_cache():
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "cached_articles": len(CACHE)}
+    return {"status": "ok", "cached_articles": len(CACHE), "lps_rows": len(lps_cache["rows"])}
